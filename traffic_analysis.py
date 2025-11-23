@@ -107,7 +107,7 @@ def port_to_int(val):
 # Optional Scapy support
 _HAS_SCAPY = False
 try:
-    from scapy.all import sniff, IP, TCP, UDP
+    from scapy.all import sniff, AsyncSniffer, IP, TCP, UDP
     _HAS_SCAPY = True
 except Exception:
     _HAS_SCAPY = False
@@ -374,7 +374,7 @@ class NetstatAnalyzer:
         except Exception:
             return Counter(), defaultdict(list), defaultdict(list)
 
-    def sample_timed(self, duration_seconds, sample_interval=1, console_append=None):
+    def sample_timed(self, duration_seconds, sample_interval=1, console_append=None, stop_event=None):
         total_counter = Counter()
         total_pids = defaultdict(list)
         total_procs = defaultdict(list)
@@ -384,6 +384,9 @@ class NetstatAnalyzer:
             return self.sample_once()
 
         while time.time() < end_at:
+            if stop_event and stop_event.is_set():
+                if console_append: console_append("Netstat sampling cancelled.")
+                break
             if console_append:
                 console_append(f"[{datetime.now().strftime('%H:%M:%S')}] Sampling netstat...")
             c, pmap, procs = self.sample_once()
@@ -394,6 +397,7 @@ class NetstatAnalyzer:
                 total_procs[k].extend(v)
             wait_until = time.time() + sample_interval
             while time.time() < wait_until:
+                if stop_event and stop_event.is_set(): break
                 time.sleep(0.05)
 
         for r in list(total_pids.keys()):
@@ -410,7 +414,7 @@ class ScapySniffer:
             raise RuntimeError("scapy not available")
         self.iface = iface
 
-    def sample_timed(self, duration_seconds, console_append=None):
+    def sample_timed(self, duration_seconds, console_append=None, stop_event=None):
         counter = {}
         start_time = time.time()
         if console_append:
@@ -462,7 +466,20 @@ class ScapySniffer:
             except Exception:
                 pass
 
-        sniff(count=0, prn=pkt_cb, timeout=duration_seconds, iface=self.iface)
+        # Use AsyncSniffer for non-blocking capture
+        t = AsyncSniffer(prn=pkt_cb, iface=self.iface)
+        t.start()
+        
+        # Wait loop with check for stop_event
+        end_at = time.time() + duration_seconds
+        while time.time() < end_at:
+            if stop_event and stop_event.is_set():
+                if console_append: console_append("Scapy capture cancelled.")
+                break
+            time.sleep(0.1)
+            
+        if t.running:
+            t.stop()
 
         # Stop sampler
         stop_sampling.set()
@@ -660,13 +677,8 @@ def save_traffic_report_html(counter_map, mode="netstat", prefix="traffic", info
     <title>Traffic Analysis Report - {ts}</title>
     <style>
         body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #f9f9f9; }}
-        h1 {{ color: #333; }}
-        .summary {{ margin-bottom: 20px; padding: 15px; background-color: #fff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-        table {{ border-collapse: collapse; width: 100%; background-color: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.1); border-radius: 8px; overflow: hidden; }}
-        th, td {{ padding: 12px 15px; text-align: left; border-bottom: 1px solid #ddd; }}
-        th {{ background-color: #007bff; color: white; font-weight: 600; text-transform: uppercase; font-size: 0.85rem; }}
-        tr:nth-child(even) {{ background-color: #f8f9fa; }}
-        tr:hover {{ background-color: #e9ecef; }}
+        tr:nth-child(even) {{ background-color: transparent; }}
+        tr:hover {{ filter: brightness(0.95); }}
         .val {{ font-family: monospace; font-weight: bold; }}
     </style>
 </head>
@@ -694,12 +706,23 @@ def save_traffic_report_html(counter_map, mode="netstat", prefix="traffic", info
         <tbody>
 """
     
+    max_val = top[0][1] if top else 1
+    
     for i, (ip, val) in enumerate(top):
+        # Calculate color: Green (low) -> Red (high)
+        # Logarithmic scale might be better if variance is huge, but linear is requested "gradient"
+        # Let's use linear ratio relative to max_val
+        ratio = val / max_val
+        # Hue: 120 (Green) -> 0 (Red)
+        hue = 120 * (1 - ratio)
+        # Lightness: 90% (very light pastel)
+        color = f"hsl({hue}, 70%, 90%)"
+        
         rev = ip_to_dns.get(ip, ip)
         pids = ", ".join(info_map.get(ip, [])) if info_map else ""
         procs = ", ".join(processes_map.get(ip, [])) if processes_map else ""
         
-        html_content += f"""            <tr>
+        html_content += f"""            <tr style="background-color: {color};">
                 <td>{i+1}</td>
                 <td>{ip}</td>
                 <td>{rev}</td>

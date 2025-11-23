@@ -12,6 +12,41 @@ from utils import ensure_results_dir
 import ctypes
 import sys
 import os
+import winsound
+import threading
+
+# ------------------- Settings -------------------
+def load_settings():
+    settings = {"sfx_enabled": True}
+    try:
+        if os.path.exists("settings.yaml"):
+            with open("settings.yaml", "r") as f:
+                for line in f:
+                    if ":" in line:
+                        key, val = line.split(":", 1)
+                        key = key.strip()
+                        val = val.strip().lower()
+                        if val == "true":
+                            settings[key] = True
+                        elif val == "false":
+                            settings[key] = False
+                        else:
+                            settings[key] = val
+    except Exception as e:
+        print(f"Error loading settings: {e}")
+    return settings
+
+SETTINGS = load_settings()
+
+def play_sound(sound_alias):
+    if SETTINGS.get("sfx_enabled", True):
+        try:
+            winsound.MessageBeep(sound_alias)
+        except:
+            pass
+
+
+traffic_stop_event = threading.Event()
 
 # ------------------- Admin check -------------------
 def is_admin():
@@ -25,12 +60,63 @@ def is_admin():
         return os.geteuid() == 0
 
 # ------------------- Init -------------------
+# ------------------- Animation -------------------
+class ActivitySpinner(tk.Canvas):
+    def __init__(self, parent, width=200, height=6, color="#0078D7"):
+        try:
+            bg_color = parent.cget("background")
+        except:
+            try:
+                bg_color = ttk.Style().lookup("TFrame", "background")
+            except:
+                bg_color = "white"
+        
+        if not bg_color: bg_color = "white"
+            
+        super().__init__(parent, width=width, height=height, bg=bg_color, highlightthickness=0)
+        self.width = width
+        self.height = height
+        self.color = color
+        self.rect = self.create_rectangle(0, 0, 40, height, fill=color, width=0)
+        self.pos = 0
+        self.direction = 1
+        self.running = False
+        self._animate()
+
+    def start(self):
+        if not self.running:
+            self.running = True
+            self.pack(side="bottom", fill="x", pady=5)
+            self._animate()
+
+    def stop(self):
+        self.running = False
+        self.pack_forget()
+
+    def _animate(self):
+        if not self.running:
+            return
+        
+        # Move
+        step = 5
+        self.pos += step * self.direction
+        
+        # Bounce
+        if self.pos + 40 >= self.width:
+            self.direction = -1
+        elif self.pos <= 0:
+            self.direction = 1
+            
+        self.coords(self.rect, self.pos, 0, self.pos + 40, self.height)
+        self.after(20, self._animate)
+
 # ------------------- Auto-Close Popup -------------------
 class AutoCloseMessageBox(tk.Toplevel):
     def __init__(self, parent, title, message, timeout=10):
         super().__init__(parent)
+        play_sound(winsound.MB_ICONQUESTION)  # Popup Open Sound
         self.title(title)
-        self.geometry("400x180")
+        self.geometry("400x230")
         self.resizable(False, False)
         
         # Center relative to parent
@@ -42,25 +128,32 @@ class AutoCloseMessageBox(tk.Toplevel):
             pass
         
         self.timeout = timeout
-        self.remaining = timeout
+        self.start_time = time.time()
         self.cancelled = False
         
-        # UI
+        # Progress bar (Canvas) at the bottom - "Fine line"
+        # We pack this first with side=bottom so it stays at the bottom
+        # Use system background color for the canvas background
+        bg_color = self.cget("bg")
+        self.canvas = tk.Canvas(self, height=4, highlightthickness=0, bg=bg_color)
+        self.canvas.pack(side="bottom", fill="x")
+        
+        # Fill color: a nice blue. #0078D7 is a standard accent blue.
+        self.rect = self.canvas.create_rectangle(0, 0, 400, 4, fill="#0078D7", width=0)
+        
+        # UI Content Frame
         frame = ttk.Frame(self, padding=20)
-        frame.pack(fill="both", expand=True)
+        frame.pack(side="top", fill="both", expand=True)
         
-        ttk.Label(frame, text=message, wraplength=360, justify="center").pack(pady=(0, 15))
-        
-        self.progress = ttk.Progressbar(frame, maximum=timeout, value=timeout, length=300)
-        self.progress.pack(pady=(0, 10))
+        ttk.Label(frame, text=message, wraplength=360, justify="center").pack(pady=(10, 20))
         
         self.lbl_timer = ttk.Label(frame, text=f"Auto-closing in {timeout}s...")
-        self.lbl_timer.pack(pady=(0, 10))
+        self.lbl_timer.pack(pady=(0, 15))
         
         ttk.Button(frame, text="Close Now", command=self.close).pack()
         
         # Start timer
-        self.after(1000, self._tick)
+        self.after(50, self._tick)
         
         # Handle X button
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -69,17 +162,27 @@ class AutoCloseMessageBox(tk.Toplevel):
         if self.cancelled:
             return
             
-        self.remaining -= 1
-        self.progress['value'] = self.remaining
-        self.lbl_timer.config(text=f"Auto-closing in {self.remaining}s...")
+        elapsed = time.time() - self.start_time
+        remaining = self.timeout - elapsed
         
-        if self.remaining <= 0:
+        if remaining <= 0:
+            play_sound(winsound.MB_OK)  # Popup Close Sound
             self.destroy()
-        else:
-            self.after(1000, self._tick)
+            return
+            
+        # Update text (rounded up)
+        self.lbl_timer.config(text=f"Auto-closing in {int(remaining) + 1}s...")
+        
+        # Update bar width
+        # Window width is 400
+        current_width = 400 * (remaining / self.timeout)
+        self.canvas.coords(self.rect, 0, 0, current_width, 4)
+        
+        self.after(50, self._tick)
             
     def close(self):
         self.cancelled = True
+        play_sound(winsound.MB_OK)  # Popup Close Sound
         self.destroy()
 
 # ------------------- Init -------------------
@@ -132,6 +235,9 @@ admin_status.pack(side="right", padx=6)
 if is_admin():
     admin_status.config(text="Admin: ✅", fg="green")
 
+# Activity Spinner (hidden by default)
+spinner = ActivitySpinner(left_frame, width=200, height=6)
+
 # Right Column: Console
 right_frame = ttk.Frame(root)
 right_frame.pack(side="right", fill="both", expand=True, padx=8, pady=8)
@@ -178,6 +284,9 @@ from report import save_report_html
 import webbrowser
 
 def on_monitor_finished():
+    # Ensure UI resets (thread-safe)
+    root.after(0, lambda: set_ui_state(False))
+    
     data = mon.get_data()
     if data["latencies"]:
         def _task():
@@ -185,7 +294,10 @@ def on_monitor_finished():
             try:
                 fname = save_report_html(data, prefix="result")
                 append_console(f"Final result saved to {fname}")
+                play_sound(winsound.MB_ICONASTERISK)  # Report Open Sound
                 webbrowser.open(os.path.abspath(fname))
+                # Auto-close popup for finished execution
+                AutoCloseMessageBox(root, "Execution Finished", f"Report saved to:\n{fname}\n\nOpened in browser.", timeout=10)
             except Exception as e:
                 append_console(f"Failed to save final result: {e}")
         threading.Thread(target=_task, daemon=True).start()
@@ -193,6 +305,21 @@ def on_monitor_finished():
 mon._finished_callback = on_monitor_finished
 
 # ------------------- Monitor Controls -------------------
+def set_ui_state(running):
+    state = "disabled" if running else "normal"
+    inv_state = "normal" if running else "disabled"
+    
+    start_btn.config(state=state)
+    traffic_simple_btn.config(state=state)
+    traffic_advanced_btn.config(state=state)
+    
+    stop_btn.config(state=inv_state)
+    
+    if running:
+        spinner.start()
+    else:
+        spinner.stop()
+
 def start_test():
     try:
         h = int(hours_entry.get() or 0)
@@ -207,11 +334,17 @@ def start_test():
         return
 
     started = mon.start(duration_seconds=duration, interval_seconds=interval)
+    if started:
+        play_sound(winsound.MB_ICONASTERISK)  # Start Sound
+        set_ui_state(True)
     append_console(f"Monitoring started for {h}h {m}m {s}s (interval {interval}s)" if started else "Monitor already running")
 
 def stop_test():
     mon.stop()
-    append_console("Monitoring stopped by user")
+    traffic_stop_event.set()  # Signal traffic analysis to stop
+    set_ui_state(False)
+    play_sound(winsound.MB_ICONHAND)  # Stop Sound
+    append_console("Monitoring/Analysis stopped by user")
 
 def partial_result():
     data = mon.get_data()
@@ -223,6 +356,7 @@ def partial_result():
         try:
             fname = save_report_html(data, prefix="partial")
             append_console(f"Partial snapshot saved to {fname}")
+            play_sound(winsound.MB_ICONEXCLAMATION)  # Partial Snapshot Sound
             webbrowser.open(os.path.abspath(fname))
             messagebox.showinfo("Partial Saved", f"Saved to:\n{fname}")
         except Exception as e:
@@ -232,6 +366,22 @@ def partial_result():
 
 def full_result_snapshot():
     data = mon.get_data()
+    if not data["latencies"]:
+        messagebox.showerror("No data", "No samples collected yet.")
+        return
+    def _task():
+        append_console("Generating full snapshot...")
+        try:
+            fname = save_report_html(data, prefix="full_snapshot")
+            append_console(f"Full snapshot saved to {fname}")
+            play_sound(winsound.MB_ICONASTERISK)  # Report Open Sound
+            webbrowser.open(os.path.abspath(fname))
+            AutoCloseMessageBox(root, "Full Snapshot", f"Saved to:\n{fname}", timeout=10)
+        except Exception as e:
+            append_console(f"Failed to save full snapshot: {e}")
+            messagebox.showerror("Error", str(e))
+    threading.Thread(target=_task, daemon=True).start()
+
 full_btn.config(command=full_result_snapshot)
 
 # ------------------- Traffic Controls -------------------
@@ -251,14 +401,20 @@ def show_traffic_simple():
         return
 
     def _task():
+        traffic_stop_event.clear()
+        set_ui_state(True)
+        play_sound(winsound.MB_ICONASTERISK)  # Start Sound
         append_console(f"Netstat sampling for {duration}s (sampling every 1s)...")
         analyzer = NetstatAnalyzer()
         try:
-            agg, pmap = analyzer.sample_timed(duration_seconds=duration, sample_interval=1)
+            agg, pmap = analyzer.sample_timed(duration_seconds=duration, sample_interval=1, stop_event=traffic_stop_event)
         except Exception as e:
             append_console(f"netstat sampling failed: {e}")
             messagebox.showerror("Netstat error", str(e))
+            set_ui_state(False)
             return
+        
+        set_ui_state(False)
 
         if not agg:
             append_console("Netstat sampling returned no data.")
@@ -287,7 +443,7 @@ def show_traffic_simple():
             append_console(f"Netstat traffic report saved to {fname}")
             
             # Auto-close popup
-            AutoCloseMessageBox(root, "Traffic Saved", f"Saved to:\n{fname}\n\n(Auto-closing in 10s)", timeout=10)
+            AutoCloseMessageBox(root, "Traffic Saved", f"Saved to:\n{fname}", timeout=10)
         except Exception as e:
             append_console(f"Failed to save netstat traffic report: {e}")
             messagebox.showerror("Error", str(e))
@@ -305,11 +461,14 @@ def show_traffic_advanced():
         return
 
     def _task():
+        traffic_stop_event.clear()
+        set_ui_state(True)
+        play_sound(winsound.MB_ICONASTERISK)  # Start Sound
         append_console(f"Advanced scapy capture for {duration}s (requires privileges)...")
         try:
             sniffer = ScapySniffer()
             # capture
-            counter_map, info_map, processes_map = sniffer.sample_timed(duration_seconds=duration, console_append=append_console)
+            counter_map, info_map, processes_map = sniffer.sample_timed(duration_seconds=duration, console_append=append_console, stop_event=traffic_stop_event)
             
             if info_map:
                 append_console(f"Correlation found PIDs for {len(info_map)} remote keys.")
@@ -330,13 +489,16 @@ def show_traffic_advanced():
             
             # Open in browser
             import webbrowser
+            play_sound(winsound.MB_ICONASTERISK)  # Report Open Sound
             webbrowser.open(os.path.abspath(fname))
             
             # Auto-close popup
-            AutoCloseMessageBox(root, "Traffic Saved", f"Saved to:\n{fname}\n\nOpened in browser.\n(Auto-closing in 10s)", timeout=10)
+            AutoCloseMessageBox(root, "Traffic Saved", f"Saved to:\n{fname}\n\nOpened in browser.", timeout=10)
         except Exception as e:
             append_console(f"Advanced capture failed: {e}")
             messagebox.showerror("Advanced capture error", str(e))
+        finally:
+            set_ui_state(False)
 
     threading.Thread(target=_task, daemon=True).start()
 
