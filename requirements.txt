@@ -1,0 +1,4 @@
+requests
+scapy
+matplotlib
+psutil
