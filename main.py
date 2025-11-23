@@ -482,7 +482,7 @@ def show_traffic_advanced():
             # Log summary to console
             try:
                 from traffic_analysis import format_traffic_summary
-                summary_text = format_traffic_summary(counter_map, info_map, processes_map)
+                summary_text = format_traffic_summary(counter_map, info_map, processes_map, mode="scapy")
                 append_console(summary_text)
             except Exception as e:
                 append_console(f"Error generating summary: {e}")

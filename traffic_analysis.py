@@ -565,7 +565,8 @@ def save_traffic_report(counter_map,
     ax_bar.set_yticks(y_pos)
     ax_bar.set_yticklabels(labels)
     ax_bar.set_title(f"Top {len(labels)} remote endpoints ({mode})")
-    ax_bar.set_xlabel("Connections / Bytes (aggregated)")
+    unit_label = "Total Bytes" if mode == "scapy" else "Samples (Duration)"
+    ax_bar.set_xlabel(f"Volume ({unit_label})")
 
     ax_table = fig.add_subplot(gs[3:5, 0])
     ax_table.axis('off')
@@ -580,7 +581,7 @@ def save_traffic_report(counter_map,
         procs = ", ".join(processes_map.get(label, [])) if processes_map else "<none>"
         table_data.append([str(i+1), label, rev, pids or "<none>", procs or "<none>", str(val)])
 
-    col_labels = ["#", "Remote", "Reverse", "PIDs", "Processes", "Count"]
+    col_labels = ["#", "Remote", "Reverse", "PIDs", "Processes", unit_label]
     table = ax_table.table(cellText=table_data, colLabels=col_labels, loc='center', cellLoc='left')
     table.auto_set_font_size(False)
     table.set_fontsize(8)
@@ -603,7 +604,7 @@ def save_traffic_report(counter_map,
     plt.close(fig)
     return filename
 
-def format_traffic_summary(counter_map, info_map=None, processes_map=None, top_n=10):
+def format_traffic_summary(counter_map, info_map=None, processes_map=None, top_n=10, mode="netstat"):
     """Generate a text summary of the traffic analysis with dynamic column widths."""
     
     # Prepare data rows
@@ -619,8 +620,9 @@ def format_traffic_summary(counter_map, info_map=None, processes_map=None, top_n
         rows.append((str(ip), str(val), str(proc)))
 
     # Calculate max widths (min width is header length)
+    unit_label = "Total Bytes" if mode == "scapy" else "Samples"
     w_ip = max([len(r[0]) for r in rows] + [len("Remote IP")]) + 2
-    w_val = max([len(r[1]) for r in rows] + [len("Count/Bytes")]) + 2
+    w_val = max([len(r[1]) for r in rows] + [len(unit_label)]) + 2
     w_proc = max([len(r[2]) for r in rows] + [len("Process")]) + 2
     
     total_width = w_ip + w_val + w_proc + 6 # +6 for separators
@@ -632,7 +634,7 @@ def format_traffic_summary(counter_map, info_map=None, processes_map=None, top_n
     lines.append("-" * total_width)
     
     # Header
-    lines.append(f"{'Remote IP':<{w_ip}} | {'Count/Bytes':<{w_val}} | {'Process':<{w_proc}}")
+    lines.append(f"{'Remote IP':<{w_ip}} | {unit_label:<{w_val}} | {'Process':<{w_proc}}")
     lines.append("-" * total_width)
     
     # Rows
@@ -671,6 +673,7 @@ def save_traffic_report_html(counter_map, mode="netstat", prefix="traffic", info
             except Exception:
                 ip_to_dns[ip] = ip
 
+    unit_label = "Total Bytes" if mode == "scapy" else "Samples"
     html_content = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -700,7 +703,7 @@ def save_traffic_report_html(counter_map, mode="netstat", prefix="traffic", info
                 <th>Reverse DNS</th>
                 <th>PIDs</th>
                 <th>Process</th>
-                <th>Count/Bytes</th>
+                <th>{unit_label}</th>
             </tr>
         </thead>
         <tbody>
