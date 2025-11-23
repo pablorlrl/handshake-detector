@@ -12,6 +12,97 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from utils import ensure_results_dir, timestamp_str
 from datetime import datetime
+import ctypes
+from ctypes import wintypes
+
+# ctypes constants and structures
+NO_ERROR = 0
+AF_INET = 2
+TCP_TABLE_OWNER_PID_ALL = 5
+UDP_TABLE_OWNER_PID = 1
+
+class MIB_TCPROW_OWNER_PID(ctypes.Structure):
+    _fields_ = [
+        ("dwState", ctypes.c_ulong),
+        ("dwLocalAddr", ctypes.c_ulong),
+        ("dwLocalPort", ctypes.c_ulong),
+        ("dwRemoteAddr", ctypes.c_ulong),
+        ("dwRemotePort", ctypes.c_ulong),
+        ("dwOwningPid", ctypes.c_ulong)
+    ]
+
+class MIB_UDPROW_OWNER_PID(ctypes.Structure):
+    _fields_ = [
+        ("dwLocalAddr", ctypes.c_ulong),
+        ("dwLocalPort", ctypes.c_ulong),
+        ("dwOwningPid", ctypes.c_ulong)
+    ]
+
+def get_tcp_table_ctypes():
+    """Get TCP table using GetExtendedTcpTable (Windows)."""
+    table = []
+    if not sys.platform.startswith("win"):
+        return table
+        
+    try:
+        GetExtendedTcpTable = ctypes.windll.iphlpapi.GetExtendedTcpTable
+        GetExtendedTcpTable.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.c_bool, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        GetExtendedTcpTable.restype = ctypes.c_ulong
+        
+        size = ctypes.c_ulong(0)
+        # First call to get size
+        GetExtendedTcpTable(None, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0)
+        
+        buf = ctypes.create_string_buffer(size.value)
+        if GetExtendedTcpTable(buf, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR:
+            # Parse buffer manually to avoid defining variable sized structure
+            # DWORD dwNumEntries
+            # MIB_TCPROW_OWNER_PID table[ANY_SIZE]
+            num_entries = ctypes.cast(buf, ctypes.POINTER(ctypes.c_ulong))[0]
+            row_size = ctypes.sizeof(MIB_TCPROW_OWNER_PID)
+            offset = ctypes.sizeof(ctypes.c_ulong)
+            
+            for _ in range(num_entries):
+                row = MIB_TCPROW_OWNER_PID.from_buffer(buf, offset)
+                table.append((row.dwState, row.dwLocalAddr, row.dwLocalPort, row.dwRemoteAddr, row.dwRemotePort, row.dwOwningPid))
+                offset += row_size
+    except Exception:
+        pass
+    return table
+
+def get_udp_table_ctypes():
+    """Get UDP table using GetExtendedUdpTable (Windows)."""
+    table = []
+    if not sys.platform.startswith("win"):
+        return table
+        
+    try:
+        GetExtendedUdpTable = ctypes.windll.iphlpapi.GetExtendedUdpTable
+        GetExtendedUdpTable.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.c_bool, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        GetExtendedUdpTable.restype = ctypes.c_ulong
+        
+        size = ctypes.c_ulong(0)
+        GetExtendedUdpTable(None, ctypes.byref(size), False, AF_INET, UDP_TABLE_OWNER_PID, 0)
+        
+        buf = ctypes.create_string_buffer(size.value)
+        if GetExtendedUdpTable(buf, ctypes.byref(size), False, AF_INET, UDP_TABLE_OWNER_PID, 0) == NO_ERROR:
+            num_entries = ctypes.cast(buf, ctypes.POINTER(ctypes.c_ulong))[0]
+            row_size = ctypes.sizeof(MIB_UDPROW_OWNER_PID)
+            offset = ctypes.sizeof(ctypes.c_ulong)
+            
+            for _ in range(num_entries):
+                row = MIB_UDPROW_OWNER_PID.from_buffer(buf, offset)
+                table.append((row.dwLocalAddr, row.dwLocalPort, row.dwOwningPid))
+                offset += row_size
+    except Exception:
+        pass
+    return table
+
+def ip_to_str(val):
+    return socket.inet_ntoa(ctypes.c_ulong(val).value.to_bytes(4, 'little'))
+
+def port_to_int(val):
+    return socket.ntohs(val)
 
 # Optional Scapy support
 _HAS_SCAPY = False
@@ -71,50 +162,143 @@ def get_process_map_psutil():
         pass
     return ip_proc, ip_pids
 
-    return ip_proc, ip_pids
-
-def get_process_map_combined():
-    """Return {ip: process_name} and {ip: [pid]} using both psutil and netstat (Windows)."""
-    # 1. Start with psutil (fast, accurate names)
-    ip_proc, ip_pids = get_process_map_psutil()
-    
-    # 2. If Windows, augment with netstat (catches some ephemeral connections psutil misses)
-    if sys.platform.startswith("win"):
+# ------------------ Process Cache ------------------
+class ProcessNameCache:
+    def __init__(self, ttl=60):
+        self.cache = {} # pid -> (name, timestamp)
+        self.ttl = ttl
+        
+    def get(self, pid):
+        now = time.time()
+        if pid in self.cache:
+            name, ts = self.cache[pid]
+            if now - ts < self.ttl:
+                return name
+        return None
+        
+    def set(self, pid, name):
+        self.cache[pid] = (name, time.time())
+        
+    def resolve(self, pid):
+        # 1. Check cache
+        cached = self.get(pid)
+        if cached:
+            return cached
+            
+        # 2. System PIDs
+        if pid == 0:
+            name = "Idle"
+            self.set(pid, name)
+            return name
+        if pid == 4 and sys.platform.startswith("win"):
+            name = "System"
+            self.set(pid, name)
+            return name
+            
+        # 3. Resolve via psutil
         try:
-            # Parse netstat -ano directly to avoid overhead
-            # We only care about IP -> PID mapping here
-            out = subprocess.check_output("netstat -ano", shell=True, text=True, stderr=subprocess.DEVNULL)
-            
-            # Regex for parsing netstat lines: Proto Local Foreign State PID
-            # TCP    192.168.1.5:5000       1.1.1.1:443            ESTABLISHED     1234
-            regex = re.compile(r'^\s*(TCP|UDP)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)\s*$', re.IGNORECASE)
-            
-            for line in out.splitlines():
-                m = regex.match(line)
-                if not m:
-                    continue
-                _, _, foreign, state, pid_str = m.groups()
-                
-                if state.upper() in ("ESTABLISHED", "ESTAB", "SYN_SENT", "SYN_RECEIVED"):
-                    # Add PID
-                    if pid_str not in ip_pids[foreign]:
-                        ip_pids[foreign].append(pid_str)
-                    
-                    # Resolve Name if missing
-                    if foreign not in ip_proc or ip_proc[foreign] in ("<none>", ""):
-                        try:
-                            # Try psutil first (fast)
-                            proc = psutil.Process(int(pid_str))
-                            ip_proc[foreign] = proc.name()
-                        except:
-                            # Fallback to tasklist only if absolutely necessary? 
-                            # Actually, tasklist is too slow for a loop. 
-                            # If psutil fails (e.g. Access Denied), we might just leave it as <unknown> or PID
-                            pass
-                        
+            if psutil:
+                proc = psutil.Process(pid)
+                name = proc.name()
+                self.set(pid, name)
+                return name
         except Exception:
             pass
             
+        # 4. Fallback (Windows tasklist - slow, avoid if possible, or maybe we already have it?)
+        return None
+
+_proc_cache = ProcessNameCache(ttl=60)
+
+# ------------------ IP Process Cache ------------------
+class IpProcessCache:
+    """Cache to remember which process was last seen on a remote IP."""
+    def __init__(self, ttl=60):
+        self.cache = {} # ip -> (process_name, timestamp)
+        self.ttl = ttl
+        
+    def update(self, ip, name):
+        if name and name not in ("<none>", "<unknown>", ""):
+            self.cache[ip] = (name, time.time())
+            
+    def get(self, ip):
+        if ip in self.cache:
+            name, ts = self.cache[ip]
+            if time.time() - ts < self.ttl:
+                return name
+        return None
+
+_ip_cache = IpProcessCache(ttl=60)
+
+def get_process_map_combined():
+    """Return {ip: process_name} and {ip: [pid]} using both psutil and ctypes (Windows)."""
+    # 1. Start with psutil (fast, accurate names)
+    ip_proc, ip_pids = get_process_map_psutil()
+    
+    # 2. If Windows, augment with ctypes (much faster than netstat subprocess)
+    if sys.platform.startswith("win"):
+        try:
+            # TCP
+            tcp_rows = get_tcp_table_ctypes()
+            for state, local_addr, local_port, remote_addr, remote_port, pid in tcp_rows:
+                # Filter states if needed, but we want most
+                # MIB_TCP_STATE_ESTAB = 5, etc.
+                # Just take all for now to be safe, or filter 0 (CLOSED)
+                if state != 0 and remote_addr != 0:
+                    remote_ip = ip_to_str(remote_addr)
+                    # remote_port_val = port_to_int(remote_port) # Not strictly needed for key if we use IP only, but usually we key by IP
+                    # Wait, our keys are IPs? Or IP:Port?
+                    # Previous code used IP as key if psutil, but netstat parsing used IP:Port?
+                    # psutil: ip_proc[ip] = name. IP is just string.
+                    # netstat: regex parsed foreign as IP:Port.
+                    # Let's standardize on IP string for now to match psutil, OR handle both.
+                    # If we use IP only, we might have collisions.
+                    # The existing code seems to mix. psutil uses `c.raddr.ip`.
+                    # Let's stick to IP string for consistency with psutil map.
+                    
+                    if pid > 0:
+                        pid_str = str(pid)
+                        if pid_str not in ip_pids[remote_ip]:
+                            ip_pids[remote_ip].append(pid_str)
+                        
+                        if remote_ip not in ip_proc or ip_proc[remote_ip] in ("<none>", ""):
+                            name = _proc_cache.resolve(pid)
+                            if name:
+                                ip_proc[remote_ip] = name
+
+            # UDP
+            udp_rows = get_udp_table_ctypes()
+            # UDP table doesn't have remote address in the owner-pid table!
+            # It only has local address. 
+            # This is a limitation of GetExtendedUdpTable. It binds local port to PID.
+            # But we need to map REMOTE IP to PID.
+            # If we are a client, we have a local port.
+            # Scapy sees the packet (SrcIP, DstIP).
+            # If we are sending to RemoteIP, we use LocalPort.
+            # We can map LocalPort -> PID.
+            # Then Scapy can look up PID by LocalPort?
+            # But get_process_map_combined is supposed to return {RemoteIP: PID}.
+            # Without remote IP in UDP table, we can't map RemoteIP -> PID directly from this table alone.
+            # However, `netstat -ano` ALSO doesn't show remote IP for UDP usually (*:*).
+            # So `netstat` parsing for UDP was likely only working if it showed the remote IP, which is rare for connected UDP.
+            # Wait, `psutil` DOES give remote IP for connected UDP.
+            # For unconnected UDP (common), we can't map RemoteIP -> PID easily without inspecting packets + local port.
+            # BUT, if we have a "connected" UDP socket, psutil should catch it.
+            # If `netstat` showed it, it means it was connected?
+            # Actually, `netstat` output for UDP is often `UDP 0.0.0.0:123 *:* 1234`. No remote.
+            # So my previous fix for netstat UDP might have been parsing `*:*` as foreign and adding it?
+            # If foreign is `*:*`, it's useless for map {RemoteIP: PID}.
+            # So `ctypes` here is fine, it just confirms we can't get RemoteIP from standard UDP table.
+            # We will rely on psutil for connected UDP.
+            pass
+
+        except Exception:
+            pass
+            
+    # Update IP Cache
+    for ip, name in ip_proc.items():
+        _ip_cache.update(ip, name)
+        
     return ip_proc, ip_pids
 
 def get_local_ips():
@@ -317,9 +501,19 @@ class ScapySniffer:
         
         matched_any = False
         for dst in list(counter.keys()):
+            # 1. Direct Map
             if dst in ip_proc_map:
                 matched_any = True
                 procs_map[dst].append(ip_proc_map[dst])
+            # 2. Fallback to IP Cache
+            else:
+                cached_name = _ip_cache.get(dst)
+                if cached_name:
+                    matched_any = True
+                    procs_map[dst].append(cached_name)
+                    # Also try to backfill PID if possible? (Hard without PID in cache, maybe add PID to cache too?)
+                    # For now just name is good.
+            
             if dst in ip_pids_map:
                 pids_map[dst].extend(ip_pids_map[dst])
                 
